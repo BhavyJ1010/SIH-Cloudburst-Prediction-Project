@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+"""
+Improved weather station simulator / core logger:
+- Thread-safe tipping counter
+- Persistent counter in DB (meta table)
+- Context managers for DB
+- CLI simulate/run-once modes
+- Simple calibration helpers & daily totals view
+"""
+
+import time
+import json
+import random
+import sqlite3
+import logging
+import argparse
+import threading
+from datetime import datetime, timezone, timedelta
+
+# ------------------------
+# Logging
+# ------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ------------------------
+# Config / DB
+# ------------------------
+DB_PATH = "weather_station.db"
+# default; replace with calibrated value after calibration routine
+RAIN_GAUGE_MM_PER_TIP = 0.2794
+
+# ------------------------
+# DB helpers
+# ------------------------
+def get_conn():
+    return sqlite3.connect(DB_PATH, timeout=30, detect_types=sqlite3.PARSE_DECLTYPES)
+
+def init_database():
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS weather_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            temperature REAL,
+            humidity REAL,
+            pressure REAL,
+            rain_mm REAL,
+            optical_is_dry INTEGER
+        )""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_weather_ts ON weather_log(timestamp)")
+
+        # meta table to persist counters and small config
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )""")
+        # ensure counter exists
+        c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('rain_gauge_count', '0')")
+        c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('rain_mm_per_tip', ?)", (str(RAIN_GAUGE_MM_PER_TIP),))
+        conn.commit()
+
+        # create a view for daily totals (UTC days)
+        c.execute("""
+        CREATE VIEW IF NOT EXISTS daily_totals AS
+        SELECT
+            date(timestamp) as day_utc,
+            SUM(rain_mm) as rain_mm_total,
+            AVG(temperature) as avg_temp,
+            AVG(humidity) as avg_humidity
+        FROM weather_log
+        GROUP BY day_utc
+        """)
+        conn.commit()
+    logging.info("DB initialized: %s", DB_PATH)
+
+def read_meta(key, default=None):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("SELECT value FROM meta WHERE key = ?", (key,))
+        r = c.fetchone()
+        return r[0] if r else default
+
+def write_meta(key, value):
+    with get_conn() as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        conn.commit()
+
+# ------------------------
+# Tipping bucket (thread-safe + persistent)
+# ------------------------
+RAIN_LOCK = threading.Lock()
+
+def increment_persistent_counter(amount=1):
+    """Increment persisted counter in DB (used by ISR)."""
+    with RAIN_LOCK:
+        # update meta counter atomically in DB
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute("BEGIN EXCLUSIVE")
+            c.execute("SELECT value FROM meta WHERE key = 'rain_gauge_count'")
+            cur = c.fetchone()
+            current = int(cur[0]) if cur else 0
+            current += int(amount)
+            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('rain_gauge_count', ?)", (str(current),))
+            conn.commit()
+    logging.debug("Persistent counter incremented: %d", current)
+
+def get_and_reset_persistent_counter():
+    with RAIN_LOCK:
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute("SELECT value FROM meta WHERE key = 'rain_gauge_count'")
+            cur = c.fetchone()
+            current = int(cur[0]) if cur else 0
+            # reset to zero
+            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('rain_gauge_count', '0')")
+            conn.commit()
+    logging.debug("Persistent counter read/reset: %d", current)
+    return current
+
+# ISR simulation helper (call from hardware ISR or simulated)
+def rain_gauge_callback():
+    increment_persistent_counter(1)
+
+# ------------------------
+# Simulated sensor functions (replace with real sensor reads)
+# ------------------------
+def read_bme280():
+    """Simulated temperature/humidity/pressure sensor."""
+    temperature = round(20 + random.uniform(-1.5, 1.5), 2)
+    humidity = round(50 + random.uniform(-5, 5), 2)
+    pressure = round(1000 + random.uniform(-5, 5), 2)
+    return temperature, humidity, pressure
+
+def read_optical_rain_sensor():
+    """Simulated optical rain sensor (1=dry, 0=wet)."""
+    return random.choices([1, 0], weights=[8, 2])[0]
+
+# ------------------------
+# Business logic
+# ------------------------
+def get_rainfall_mm():
+    """Read persisted counter, convert to mm, then reset counter."""
+    tips = get_and_reset_persistent_counter()
+    mm_per_tip = float(read_meta('rain_mm_per_tip', RAIN_GAUGE_MM_PER_TIP))
+    mm = tips * mm_per_tip
+    return round(mm, 3), tips
+
+def log_to_database(data):
+    try:
+        with get_conn() as conn:
+            c = conn.cursor()
+            c.execute("""
+                INSERT INTO weather_log (timestamp, temperature, humidity, pressure, rain_mm, optical_is_dry)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                data["timestamp"],
+                data.get("temperature"),
+                data.get("humidity"),
+                data.get("pressure"),
+                data.get("rain_mm"),
+                data.get("optical_is_dry")
+            ))
+            conn.commit()
+    except Exception as e:
+        logging.exception("Failed to write to DB: %s", e)
+        raise
+
+def gather_all_data():
+    temperature, humidity, pressure = read_bme280()
+    rain_mm, tips = get_rainfall_mm()
+    optical = read_optical_rain_sensor()
+    return {
+        "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
+        "temperature": temperature,
+        "humidity": humidity,
+        "pressure": pressure,
+        "rain_mm": rain_mm,
+        "rain_tips": tips,
+        "optical_is_dry": optical
+    }
+
+# ------------------------
+# Calibration helpers
+# ------------------------
+def calibrate_mm_per_tip(poured_mm, tips_observed):
+    """Compute mm_per_tip from controlled test."""
+    if tips_observed <= 0:
+        raise ValueError("tips_observed must be > 0")
+    mm_per_tip = poured_mm / tips_observed
+    write_meta('rain_mm_per_tip', str(mm_per_tip))
+    logging.info("Calibrated mm_per_tip = %s from poured_mm=%s, tips=%s", mm_per_tip, poured_mm, tips_observed)
+    return mm_per_tip
+
+# ------------------------
+# CLI / Main
+# ------------------------
+def main_loop(simulate=False, interval=60):
+    init_database()
+    logging.info("Starting main loop (simulate=%s, interval=%s)", simulate, interval)
+
+    try:
+        while True:
+            # in simulated mode, randomly increment tipping bucket a few times
+            if simulate:
+                # simulate several tips in the previous interval based on a Poisson-like process
+                for _ in range(random.randint(0, 3)):
+                    if random.random() < 0.4:
+                        rain_gauge_callback()
+
+            data = gather_all_data()
+            log_to_database(data)
+            logging.info("Saved: %s", json.dumps(data))
+
+            if not simulate:
+                # if running for real hardware, sleep interval seconds and loop
+                time.sleep(interval)
+            else:
+                # faster loop for simulation / testing
+                time.sleep(1)
+    except KeyboardInterrupt:
+        logging.info("Shutting down loop (KeyboardInterrupt)")
+
+def run_once():
+    init_database()
+    # simulation of a few tips first (for local testing)
+    for i in range(6):
+        if random.random() < 0.4:
+            rain_gauge_callback()
+        time.sleep(0.05)  # fast test
+    data = gather_all_data()
+    log_to_database(data)
+    print(json.dumps(data, indent=2))
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--simulate", action="store_true", help="Run simulated mode (fast loop)")
+    parser.add_argument("--interval", type=int, default=60, help="Loop interval in seconds for real mode")
+    parser.add_argument("--once", action="store_true", help="Run one cycle and exit (useful for cron)")
+    args = parser.parse_args()
+
+    if args.once:
+        run_once()
+    else:
+        main_loop(simulate=args.simulate, interval=args.interval)
