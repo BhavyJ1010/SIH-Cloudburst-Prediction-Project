@@ -1,5 +1,4 @@
-# cloudburst_pipeline.py
-# Complete pipeline: cleaning + feature engineering + plots + models
+
 
 import pandas as pd
 import numpy as np
@@ -17,9 +16,7 @@ from sklearn.metrics import (
     roc_auc_score
 )
 
-# =========================================================
-# 1. LOAD RAW DATA
-# =========================================================
+
 file_path = "/Users/namrata/Namrata/cloudburst_analysis/synthetic_cloudburst_data (1).csv"
 
 df = pd.read_csv(
@@ -34,38 +31,30 @@ print(df.info())
 print("\nNaN counts before cleaning:")
 print(df.isna().sum())
 
-# =========================================================
-# 2. IMPROVED NaN STRATEGY
-# =========================================================
-# numeric columns (except label)
+
 num_cols = df.select_dtypes(include=['int64', 'float64']).columns
 num_cols = num_cols.drop('cloudburst', errors='ignore')
 
-# 2.1 short gap interpolation
+
 df[num_cols] = df[num_cols].interpolate(
     limit=3,
     limit_direction='both'
 )
 
-# 2.2 long gaps → ffill + bfill
+
 df[num_cols] = df[num_cols].ffill().bfill()
 
 print("\nNaN counts after numeric interpolation + ffill/bfill:")
 print(df.isna().sum())
 
-# special handling for rain_last_* if they exist
 for col in ['rainfall_mm', 'rain_last_5min', 'rain_last_15min']:
     if col in df.columns:
         df[col] = df[col].fillna(0)
 
-# =========================================================
-# 3. SET INDEX FOR TIME-BASED OPERATIONS
-# =========================================================
+
 df = df.set_index('timestamp')
 
-# =========================================================
-# 4. OUTLIER / NOISE DETECTION (z-score) + CLEANING
-# =========================================================
+
 for col in ['rainfall_mm', 'pressure', 'humidity']:
     if col not in df.columns:
         continue
@@ -77,15 +66,15 @@ for col in ['rainfall_mm', 'pressure', 'humidity']:
     outlier_col = col + '_is_outlier'
 
     if col == 'rainfall_mm' and 'cloudburst' in df.columns:
-        # don't mark extreme rain during cloudburst as outlier
+        
         df[outlier_col] = (z.abs() > 3) & (df['cloudburst'] == 0)
     else:
         df[outlier_col] = z.abs() > 3
 
-    # remove outliers for smoothing by setting them to NaN
+    
     df.loc[df[outlier_col], col] = np.nan
 
-# re-interpolate after removing outliers
+
 df[num_cols] = df[num_cols].interpolate(
     limit=3,
     limit_direction='both'
@@ -94,9 +83,7 @@ df[num_cols] = df[num_cols].interpolate(
 print("\nNaN counts after outlier handling:")
 print(df.isna().sum())
 
-# =========================================================
-# 5. SMOOTHING (ROLLING MEDIAN + MEAN)
-# =========================================================
+
 for col in ['rainfall_mm', 'pressure', 'humidity']:
     if col not in df.columns:
         continue
@@ -105,18 +92,16 @@ for col in ['rainfall_mm', 'pressure', 'humidity']:
     smooth = med.rolling(window=5, center=True, min_periods=1).mean()
     df[col + '_smooth'] = smooth
 
-# =========================================================
-# 6. FEATURE ENGINEERING
-# =========================================================
+
 rain_series = df['rainfall_mm_smooth'] if 'rainfall_mm_smooth' in df.columns else df['rainfall_mm']
 pressure_series = df['pressure_smooth'] if 'pressure_smooth' in df.columns else df['pressure']
 humidity_series = df['humidity_smooth'] if 'humidity_smooth' in df.columns else df['humidity']
 
-# rolling rain totals
+
 df['rain_5'] = rain_series.rolling('5min').sum()
 df['rain_15'] = rain_series.rolling('15min').sum()
 
-# assume ~5-min time step → 3 rows ≈ 15 min
+
 periods_15 = 3
 
 df['pressure_prev_15'] = pressure_series.shift(periods_15)
@@ -125,18 +110,16 @@ df['pressure_drop_15'] = df['pressure_prev_15'] - pressure_series
 df['humidity_prev_15'] = humidity_series.shift(periods_15)
 df['humidity_change_15'] = humidity_series - df['humidity_prev_15']
 
-# drop rows with NaN from rolling / shifting
+
 df = df.dropna().reset_index()
 
 print("Final shape after feature engineering:", df.shape)
 
-# save engineered dataset
+
 df.to_csv("engineered_features.csv", index=False)
 print("Saved engineered_features.csv")
 
-# =========================================================
-# 7. PLOTS (EDA)
-# =========================================================
+
 plt.figure(figsize=(12, 3))
 plt.plot(df['timestamp'], df['rain_15'], label='rain_15min')
 plt.xlabel("Time")
@@ -171,9 +154,7 @@ sns.heatmap(corr, annot=True, fmt=".2f")
 plt.tight_layout()
 plt.savefig("corr_heatmap.png")
 
-# =========================================================
-# 8. MODELING – RULE-BASED + ML
-# =========================================================
+
 print("\n=== MODELING SECTION ===")
 
 assert 'cloudburst' in df.columns, "No 'cloudburst' column found for modeling."
@@ -197,7 +178,7 @@ X_train, X_test, y_train, y_test = train_test_split(
 
 print("Train size:", X_train.shape[0], " Test size:", X_test.shape[0])
 
-# --------- 8.1 Rule-based system ----------
+
 pos = df[df['cloudburst'] == 1]
 
 thr_rain15 = pos['rain_15'].quantile(0.75) if 'rain_15' in pos else None
@@ -231,7 +212,7 @@ print("Accuracy:", accuracy_score(y_test, y_rule))
 print("Confusion matrix:\n", confusion_matrix(y_test, y_rule))
 print(classification_report(y_test, y_rule, digits=3))
 
-# --------- 8.2 Logistic Regression ----------
+
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_test_scaled = scaler.transform(X_test)
@@ -252,7 +233,7 @@ try:
 except Exception as e:
     print("Could not compute AUC:", e)
 
-# --------- 8.3 Random Forest ----------
+
 rf = RandomForestClassifier(
     n_estimators=200,
     max_depth=None,
@@ -274,7 +255,7 @@ try:
 except Exception as e:
     print("Could not compute AUC:", e)
 
-# feature importance
+
 importances = pd.Series(rf.feature_importances_, index=feature_cols).sort_values(ascending=False)
 print("\n=== Random Forest feature importance ===")
 print(importances)
