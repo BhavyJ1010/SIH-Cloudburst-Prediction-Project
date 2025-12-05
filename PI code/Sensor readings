@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 """
 Improved weather station simulator / core logger:
-- Thread-safe tipping counter
+- Thread-safe tipping counter for tipping-bucket rain gauge
 - Persistent counter in DB (meta table)
-- Context managers for DB
+- SHT temperature + humidity sensor
+- BME280 pressure sensor
+- Classic 3-cup anemometer for wind speed
 - CLI simulate/run-once modes
 - Simple calibration helpers & daily totals view
+
+NOTE:
+Currently the sensor read functions are SIMULATED.
+Once hardware is wired, replace the bodies of:
+  - read_sht_temp_humidity()
+  - read_bme280_pressure()
+  - read_anemometer()
+with real sensor code (I2C / GPIO).
 """
 
 import time
@@ -46,7 +56,8 @@ def init_database():
             humidity REAL,
             pressure REAL,
             rain_mm REAL,
-            optical_is_dry INTEGER
+            optical_is_dry INTEGER,
+            wind_speed REAL    -- average wind speed during interval (e.g. km/h or m/s)
         )""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_weather_ts ON weather_log(timestamp)")
 
@@ -58,7 +69,10 @@ def init_database():
         )""")
         # ensure counter exists
         c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('rain_gauge_count', '0')")
-        c.execute("INSERT OR IGNORE INTO meta (key, value) VALUES ('rain_mm_per_tip', ?)", (str(RAIN_GAUGE_MM_PER_TIP),))
+        c.execute(
+            "INSERT OR IGNORE INTO meta (key, value) VALUES ('rain_mm_per_tip', ?)",
+            (str(RAIN_GAUGE_MM_PER_TIP),),
+        )
         conn.commit()
 
         # create a view for daily totals (UTC days)
@@ -85,7 +99,11 @@ def read_meta(key, default=None):
 def write_meta(key, value):
     with get_conn() as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+        c.execute(
+            "INSERT INTO meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
         conn.commit()
 
 # ------------------------
@@ -94,9 +112,8 @@ def write_meta(key, value):
 RAIN_LOCK = threading.Lock()
 
 def increment_persistent_counter(amount=1):
-    """Increment persisted counter in DB (used by ISR)."""
+    """Increment persisted tipping-bucket counter in DB (used by ISR)."""
     with RAIN_LOCK:
-        # update meta counter atomically in DB
         with get_conn() as conn:
             c = conn.cursor()
             c.execute("BEGIN EXCLUSIVE")
@@ -104,11 +121,16 @@ def increment_persistent_counter(amount=1):
             cur = c.fetchone()
             current = int(cur[0]) if cur else 0
             current += int(amount)
-            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('rain_gauge_count', ?)", (str(current),))
+            c.execute(
+                "INSERT OR REPLACE INTO meta (key, value) "
+                "VALUES ('rain_gauge_count', ?)",
+                (str(current),),
+            )
             conn.commit()
     logging.debug("Persistent counter incremented: %d", current)
 
 def get_and_reset_persistent_counter():
+    """Read & reset tipping-bucket counter (tips since last interval)."""
     with RAIN_LOCK:
         with get_conn() as conn:
             c = conn.cursor()
@@ -116,36 +138,63 @@ def get_and_reset_persistent_counter():
             cur = c.fetchone()
             current = int(cur[0]) if cur else 0
             # reset to zero
-            c.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('rain_gauge_count', '0')")
+            c.execute(
+                "INSERT OR REPLACE INTO meta (key, value) "
+                "VALUES ('rain_gauge_count', '0')"
+            )
             conn.commit()
     logging.debug("Persistent counter read/reset: %d", current)
     return current
 
-# ISR simulation helper (call from hardware ISR or simulated)
+# ISR simulation helper (in real hardware ISR you call this)
 def rain_gauge_callback():
     increment_persistent_counter(1)
 
 # ------------------------
 # Simulated sensor functions (replace with real sensor reads)
 # ------------------------
-def read_bme280():
-    """Simulated temperature/humidity/pressure sensor."""
-    temperature = round(20 + random.uniform(-1.5, 1.5), 2)
-    humidity = round(50 + random.uniform(-5, 5), 2)
-    pressure = round(1000 + random.uniform(-5, 5), 2)
-    return temperature, humidity, pressure
+def read_sht_temp_humidity():
+    """
+    SHT temperature + humidity sensor.
+    SIMULATED right now; replace with real I2C read:
 
-def read_optical_rain_sensor():
-    """Simulated optical rain sensor (1=dry, 0=wet)."""
-    return random.choices([1, 0], weights=[8, 2])[0]
+        temperature_c = sht.temperature
+        humidity_rh = sht.relative_humidity
+    """
+    temperature = round(25 + random.uniform(-3, 3), 2)   # °C
+    humidity = round(60 + random.uniform(-15, 15), 2)    # %
+    return temperature, humidity
+
+def read_bme280_pressure():
+    """
+    BME280 pressure sensor (using only pressure).
+    SIMULATED right now; replace with:
+
+        pressure_hpa = bme280.pressure
+    """
+    pressure = round(1008 + random.uniform(-8, 8), 2)    # hPa
+    return pressure
+
+def read_anemometer(interval_s=60):
+    """
+    Classic 3-cup anemometer.
+    Currently SIMULATED: returns a random wind speed.
+
+    When you connect the real anemometer:
+      - count pulses over 'interval_s'
+      - convert pulses/time to speed using a calibrated factor.
+    """
+    # Example: light breeze to moderate wind
+    wind_speed = round(random.uniform(0, 25), 2)         # e.g. km/h
+    return wind_speed
 
 # ------------------------
 # Business logic
 # ------------------------
 def get_rainfall_mm():
-    """Read persisted counter, convert to mm, then reset counter."""
+    """Read persisted tipping-bucket counter, convert to mm, then reset counter."""
     tips = get_and_reset_persistent_counter()
-    mm_per_tip = float(read_meta('rain_mm_per_tip', RAIN_GAUGE_MM_PER_TIP))
+    mm_per_tip = float(read_meta("rain_mm_per_tip", RAIN_GAUGE_MM_PER_TIP))
     mm = tips * mm_per_tip
     return round(mm, 3), tips
 
@@ -153,26 +202,46 @@ def log_to_database(data):
     try:
         with get_conn() as conn:
             c = conn.cursor()
-            c.execute("""
-                INSERT INTO weather_log (timestamp, temperature, humidity, pressure, rain_mm, optical_is_dry)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (
-                data["timestamp"],
-                data.get("temperature"),
-                data.get("humidity"),
-                data.get("pressure"),
-                data.get("rain_mm"),
-                data.get("optical_is_dry")
-            ))
+            c.execute(
+                """
+                INSERT INTO weather_log (
+                    timestamp,
+                    temperature,
+                    humidity,
+                    pressure,
+                    rain_mm,
+                    optical_is_dry,
+                    wind_speed
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data["timestamp"],
+                    data.get("temperature"),
+                    data.get("humidity"),
+                    data.get("pressure"),
+                    data.get("rain_mm"),
+                    data.get("optical_is_dry"),
+                    data.get("wind_speed"),
+                ),
+            )
             conn.commit()
     except Exception as e:
         logging.exception("Failed to write to DB: %s", e)
         raise
 
-def gather_all_data():
-    temperature, humidity, pressure = read_bme280()
+def gather_all_data(interval_s=60):
+    """
+    Gather a single snapshot of all sensors.
+    interval_s is used conceptually for wind measurement; in simulation we ignore it.
+    """
+    temperature, humidity = read_sht_temp_humidity()
+    pressure = read_bme280_pressure()
     rain_mm, tips = get_rainfall_mm()
-    optical = read_optical_rain_sensor()
+    wind_speed = read_anemometer(interval_s)
+    # no optical sensor now; set to None or 1 (dry) if you want
+    optical = None
+
     return {
         "timestamp": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
         "temperature": temperature,
@@ -180,19 +249,25 @@ def gather_all_data():
         "pressure": pressure,
         "rain_mm": rain_mm,
         "rain_tips": tips,
-        "optical_is_dry": optical
+        "optical_is_dry": optical,
+        "wind_speed": wind_speed,
     }
 
 # ------------------------
 # Calibration helpers
 # ------------------------
 def calibrate_mm_per_tip(poured_mm, tips_observed):
-    """Compute mm_per_tip from controlled test."""
+    """Compute mm_per_tip from controlled tipping-bucket test."""
     if tips_observed <= 0:
         raise ValueError("tips_observed must be > 0")
     mm_per_tip = poured_mm / tips_observed
-    write_meta('rain_mm_per_tip', str(mm_per_tip))
-    logging.info("Calibrated mm_per_tip = %s from poured_mm=%s, tips=%s", mm_per_tip, poured_mm, tips_observed)
+    write_meta("rain_mm_per_tip", str(mm_per_tip))
+    logging.info(
+        "Calibrated mm_per_tip = %s from poured_mm=%s, tips=%s",
+        mm_per_tip,
+        poured_mm,
+        tips_observed,
+    )
     return mm_per_tip
 
 # ------------------------
@@ -211,7 +286,7 @@ def main_loop(simulate=False, interval=60):
                     if random.random() < 0.4:
                         rain_gauge_callback()
 
-            data = gather_all_data()
+            data = gather_all_data(interval_s=interval)
             log_to_database(data)
             logging.info("Saved: %s", json.dumps(data))
 
@@ -227,19 +302,30 @@ def main_loop(simulate=False, interval=60):
 def run_once():
     init_database()
     # simulation of a few tips first (for local testing)
-    for i in range(6):
+    for _ in range(6):
         if random.random() < 0.4:
             rain_gauge_callback()
         time.sleep(0.05)  # fast test
-    data = gather_all_data()
+    data = gather_all_data(interval_s=60)
     log_to_database(data)
     print(json.dumps(data, indent=2))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--simulate", action="store_true", help="Run simulated mode (fast loop)")
-    parser.add_argument("--interval", type=int, default=60, help="Loop interval in seconds for real mode")
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit (useful for cron)")
+    parser.add_argument(
+        "--simulate", action="store_true", help="Run simulated mode (fast loop)"
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Loop interval in seconds for real mode",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one cycle and exit (useful for cron)",
+    )
     args = parser.parse_args()
 
     if args.once:
