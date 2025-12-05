@@ -1,0 +1,6 @@
+{
+  "precision_at_100": 0.93,
+  "precision_at_100_threshold_prob": 0.0007905213020406755,
+  "best_f1_threshold": 0.31532663316582915,
+  "best_f1_value": 1.0
+}
