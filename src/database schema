@@ -1,0 +1,162 @@
+import sqlite3
+
+conn = sqlite3.connect("weather.db")
+cur = conn.cursor()
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS weather_realtime (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT,
+    location_id INTEGER,
+    latitude REAL,
+    longitude REAL,
+    rainfall_mm REAL,
+    humidity REAL,
+    pressure REAL,
+    radar_dbz REAL,
+    satellite_precip REAL,
+    rain_last_5min REAL,
+    rain_last_15min REAL,
+    pressure_drop_15min REAL,
+    humidity_change REAL,
+    forecast_30min REAL,
+    cloudburst INTEGER
+)
+""")
+
+conn.commit()
+conn.close()
+
+print("✅ Database & table created successfully")
+import sqlite3
+import random
+from datetime import datetime, timedelta
+import math
+
+conn = sqlite3.connect("weather.db")
+cur = conn.cursor()
+
+# Uttarakhand locations (lat, lon)
+locations = {
+    1: (30.3165, 78.0322),  # Dehradun
+    2: (29.9457, 78.1642),  # Haridwar
+    3: (29.5971, 79.6591),  # Almora
+    4: (29.5862, 80.2180),  # Pithoragarh
+    5: (30.1469, 79.0236)   # Tehri
+}
+
+start_time = datetime.now() - timedelta(days=3)
+
+for i in range(50):
+    location_id = random.randint(1,5)
+    lat, lon = locations[location_id]
+    timestamp = (start_time + timedelta(minutes=i*30)).strftime("%Y-%m-%d %H:%M:%S")
+
+    rainfall_mm = round(random.uniform(0, 80), 2)
+    humidity = round(random.uniform(70, 98), 2)
+    pressure = round(random.uniform(995, 1015), 2)
+    satellite_precip = round(rainfall_mm + random.uniform(-3,3), 2)
+
+    Z = 200 * (satellite_precip ** 1.6) if satellite_precip > 0 else 0
+    radar_dbz = round(10 * math.log10(Z), 2) if Z > 0 else 0
+
+    rain_last_5min = round(rainfall_mm * 0.25, 2)
+    rain_last_15min = round(rainfall_mm * 0.65, 2)
+    pressure_drop_15min = round(random.uniform(0.5, 4), 2)
+    humidity_change = round(random.uniform(2, 10), 2)
+    forecast_30min = round(rainfall_mm * 1.2, 2)
+
+    cloudburst = 1 if rainfall_mm > 70 and radar_dbz > 45 else 0
+
+    cur.execute("""
+    INSERT INTO weather_realtime (
+        timestamp, location_id, latitude, longitude,
+        rainfall_mm, humidity, pressure, radar_dbz,
+        satellite_precip, rain_last_5min, rain_last_15min,
+        pressure_drop_15min, humidity_change, forecast_30min,
+        cloudburst
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        timestamp, location_id, lat, lon,
+        rainfall_mm, humidity, pressure, radar_dbz,
+        satellite_precip, rain_last_5min, rain_last_15min,
+        pressure_drop_15min, humidity_change, forecast_30min,
+        cloudburst
+    ))
+
+conn.commit()
+conn.close()
+print("✅ 50 Uttarakhand records inserted")
+
+import sqlite3
+import time
+import random
+import math
+from datetime import datetime
+
+DB = "weather.db"
+
+locations = {
+    1: (30.3165, 78.0322),
+    2: (29.9457, 78.1642),
+    3: (29.5971, 79.6591),
+    4: (29.5862, 80.2180),
+    5: (30.1469, 79.0236)
+}
+
+def rain_to_dbz(rain):
+    if rain <= 0:
+        return 0
+    Z = 200 * (rain ** 1.6)
+    return round(10 * math.log10(Z), 2)
+
+while True:
+    location_id = random.randint(1,5)
+    lat, lon = locations[location_id]
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    rainfall_mm = round(random.uniform(0, 90), 2)
+    humidity = round(random.uniform(70, 98), 2)
+    pressure = round(random.uniform(995, 1015), 2)
+    satellite_precip = round(rainfall_mm + random.uniform(-2,2), 2)
+
+    radar_dbz = rain_to_dbz(satellite_precip)
+
+    rain_last_5min = rainfall_mm * 0.3
+    rain_last_15min = rainfall_mm * 0.75
+    pressure_drop_15min = round(random.uniform(0.5, 4), 2)
+    humidity_change = round(random.uniform(2, 10), 2)
+    forecast_30min = rainfall_mm * 1.25
+
+    cloudburst = 1 if rainfall_mm > 70 and radar_dbz > 45 and pressure_drop_15min > 2 else 0
+
+    conn = sqlite3.connect(DB)
+    cur = conn.cursor()
+
+    cur.execute("""
+    INSERT INTO weather_realtime (
+        timestamp, location_id, latitude, longitude,
+        rainfall_mm, humidity, pressure, radar_dbz,
+        satellite_precip, rain_last_5min, rain_last_15min,
+        pressure_drop_15min, humidity_change, forecast_30min,
+        cloudburst
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        timestamp, location_id, lat, lon,
+        rainfall_mm, humidity, pressure, radar_dbz,
+        satellite_precip, rain_last_5min, rain_last_15min,
+        pressure_drop_15min, humidity_change,
+        forecast_30min, cloudburst
+    ))
+
+    conn.commit()
+    conn.close()
+
+    if cloudburst:
+        print("🚨 CLOUDBURST ALERT:", timestamp)
+    else:
+        print("✅ Data inserted:", timestamp)
+
+    time.sleep(300)   # 5 minutes
