@@ -1,0 +1,65 @@
+import sqlite3
+import pandas as pd
+
+# ---------- CONFIG ----------
+CSV_PATH = "synthetic_cloudburst_data (1) (1).csv"
+                                                  # change if needed
+DB_PATH = "weather.db"                       # output database file
+
+# ---------- LOAD CSV ----------
+df = pd.read_csv(CSV_PATH)
+
+# ---------- CONNECT TO SQLITE ----------
+conn = sqlite3.connect(DB_PATH)
+cur = conn.cursor()
+
+# ---------- CREATE TABLE ----------
+cur.execute("""
+CREATE TABLE IF NOT EXISTS weather_data (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    location_id TEXT NOT NULL,
+    rainfall_mm REAL,
+    humidity REAL,
+    pressure REAL,
+    radar_dbz REAL,
+    satellite_precip REAL,
+    rain_last_5min REAL,
+    rain_last_15min REAL,
+    pressure_drop_15min REAL,
+    humidity_change REAL,
+    forecast_30min REAL,
+    cloudburst INTEGER CHECK(cloudburst IN (0,1)),
+    UNIQUE(timestamp, location_id)
+);
+""")
+
+# ---------- INSERT DATA ----------
+for _, row in df.iterrows():
+    cur.execute("""
+        INSERT OR IGNORE INTO weather_data (
+            timestamp, location_id, rainfall_mm, humidity, pressure,
+            radar_dbz, satellite_precip, rain_last_5min, rain_last_15min,
+            pressure_drop_15min, humidity_change, forecast_30min, cloudburst
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+    """, (
+        row['timestamp'], row['location_id'], row['rainfall_mm'],
+        row['humidity'], row['pressure'], row['radar_dbz'],
+        row['satellite_precip'], row['rain_last_5min'],
+        row['rain_last_15min'], row['pressure_drop_15min'],
+        row['humidity_change'], row['forecast_30min'], row['cloudburst']
+    ))
+
+# ---------- SAVE ----------
+conn.commit()
+print("\n📘 Full weather_data table:\n")
+
+cur.execute("SELECT * FROM weather_data")
+rows = cur.fetchall()
+
+for row in rows:
+    print(row)
+conn.close()
+
+print("✅ Data successfully imported into weather.db!")
