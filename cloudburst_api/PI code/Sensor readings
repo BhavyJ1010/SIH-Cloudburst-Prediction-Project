@@ -1,30 +1,12 @@
-#!/usr/bin/env python3
-"""
-Weather station logger (v3) matching ML schema:
-
-timestamp, location_id, rainfall_mm, humidity, pressure, temperature,
-wind_gust, satellite_precip, radar_dbz, cloudburst,
-rain_last_5min, rain_last_15min, pressure_drop_15min,
-humidity_change, forecast_30min
-
-Hardware design target:
-- SHT temperature + humidity sensor   (I2C)
-- BME280 pressure sensor              (I2C)
-- Tipping bucket rain gauge           (reed switch, GPIO)
-- Classic 3-cup anemometer            (reed switch, GPIO)
-
-
-"""
-
 import time
 import json
 import random
-import sqlite3
 import logging
 import argparse
 import threading
 import os
 from datetime import datetime, timezone, timedelta
+import csv
 
 # ------------------------
 # Logging
@@ -42,20 +24,12 @@ try:
     IST = ZoneInfo("Asia/Kolkata")
 except Exception:
     IST = None
-    logging.warning("ZoneInfo not available; local timestamps use system time.")
+    logging.warning("ZoneInfo not available; using system time")
 
 def now_utc():
     return datetime.now(timezone.utc)
 
-def now_utc_iso():
-    return now_utc().isoformat()
-
 def now_local_for_csv():
-    """
-    Format like your sample:
-    01-07-2024 00:00
-    (DD-MM-YYYY HH:MM)
-    """
     if IST is not None:
         dt = datetime.now(IST)
     else:
@@ -63,18 +37,12 @@ def now_local_for_csv():
     return dt.strftime("%d-%m-%Y %H:%M")
 
 # ------------------------
-# Config / DB
+# Config / CSV
 # ------------------------
-DB_PATH = "weather_station.db"
 REALTIME_CSV_PATH = "realtime_features.csv"
-
 LOCATION_ID = "loc_1"
-
-# default; replace with calibrated value after calibration routine
 RAIN_GAUGE_MM_PER_TIP = 0.2794  # mm per tip
-
-# anemometer pulse → speed factor (placeholder; set using datasheet later)
-ANEMO_PULSES_TO_KMPH = 2.4  # km/h per pulse/sec (EXAMPLE ONLY)
+ANEMO_PULSES_TO_KMPH = 2.4
 
 FINAL_CSV_COLUMNS = [
     "timestamp",
@@ -95,428 +63,168 @@ FINAL_CSV_COLUMNS = [
 ]
 
 # ------------------------
-# DB helpers
-# ------------------------
-def get_conn():
-    return sqlite3.connect(
-        DB_PATH,
-        timeout=30,
-        detect_types=sqlite3.PARSE_DECLTYPES,
-    )
-
-def init_database():
-    with get_conn() as conn:
-        c = conn.cursor()
-        # main table: matches CSV + an internal UTC timestamp field
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS weather_log (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp_utc      TEXT NOT NULL,  -- internal, ISO
-            timestamp          TEXT NOT NULL,  -- CSV-style DD-MM-YYYY HH:MM
-            location_id        TEXT,
-            rainfall_mm        REAL,
-            humidity           REAL,
-            pressure           REAL,
-            temperature        REAL,
-            wind_gust          REAL,
-            satellite_precip   REAL,
-            radar_dbz          REAL,
-            cloudburst         INTEGER,
-            rain_last_5min     REAL,
-            rain_last_15min    REAL,
-            pressure_drop_15min REAL,
-            humidity_change    REAL,
-            forecast_30min     REAL
-        )
-        """)
-        c.execute(
-            "CREATE INDEX IF NOT EXISTS idx_weather_ts_utc "
-            "ON weather_log(timestamp_utc)"
-        )
-
-        # meta table for counters & config
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        )
-        """)
-        c.execute(
-            "INSERT OR IGNORE INTO meta(key, value) "
-            "VALUES ('rain_gauge_count', '0')"
-        )
-        c.execute(
-            "INSERT OR IGNORE INTO meta(key, value) "
-            "VALUES ('rain_mm_per_tip', ?)",
-            (str(RAIN_GAUGE_MM_PER_TIP),),
-        )
-        conn.commit()
-    logging.info("DB initialized: %s", DB_PATH)
-
-def read_meta(key, default=None):
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute("SELECT value FROM meta WHERE key = ?", (key,))
-        r = c.fetchone()
-        return r[0] if r else default
-
-def write_meta(key, value):
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
-        conn.commit()
-
-# ------------------------
-# Tipping bucket (thread-safe + persistent)
+# Tipping bucket + anemometer (memory only)
 # ------------------------
 RAIN_LOCK = threading.Lock()
+RAIN_TIPS = 0
 
-def increment_persistent_counter(amount: int = 1):
-    """Increment persisted tipping-bucket counter in DB (used by ISR)."""
-    with RAIN_LOCK:
-        with get_conn() as conn:
-            c = conn.cursor()
-            c.execute("BEGIN EXCLUSIVE")
-            c.execute("SELECT value FROM meta WHERE key = 'rain_gauge_count'")
-            cur = c.fetchone()
-            current = int(cur[0]) if cur else 0
-            current += int(amount)
-            c.execute(
-                "INSERT OR REPLACE INTO meta (key, value) "
-                "VALUES ('rain_gauge_count', ?)",
-                (str(current),),
-            )
-            conn.commit()
-    logging.debug("Persistent rain counter incremented: %d", current)
-
-def get_and_reset_persistent_counter() -> int:
-    """Read & reset tipping-bucket counter (tips since last interval)."""
-    with RAIN_LOCK:
-        with get_conn() as conn:
-            c = conn.cursor()
-            c.execute("SELECT value FROM meta WHERE key = 'rain_gauge_count'")
-            cur = c.fetchone()
-            current = int(cur[0]) if cur else 0
-            c.execute(
-                "INSERT OR REPLACE INTO meta (key, value) "
-                "VALUES ('rain_gauge_count', '0')"
-            )
-            conn.commit()
-    logging.debug("Persistent rain counter read/reset: %d", current)
-    return current
-
-# ISR-style helper for real hardware
-def rain_gauge_callback():
-    increment_persistent_counter(1)
-
-# ------------------------
-# Anemometer pulse counting skeleton
-# ------------------------
 WIND_PULSE_LOCK = threading.Lock()
 WIND_PULSE_COUNT = 0
 
+def rain_gauge_callback():
+    global RAIN_TIPS
+    with RAIN_LOCK:
+        RAIN_TIPS += 1
+
+def get_and_reset_rain_tips():
+    global RAIN_TIPS
+    with RAIN_LOCK:
+        tips = RAIN_TIPS
+        RAIN_TIPS = 0
+    return tips
+
 def anemometer_callback():
-    """ISR-style callback for real anemometer pulses."""
     global WIND_PULSE_COUNT
     with WIND_PULSE_LOCK:
         WIND_PULSE_COUNT += 1
 
-def get_and_reset_wind_pulses() -> int:
+def get_and_reset_wind_pulses():
     global WIND_PULSE_COUNT
     with WIND_PULSE_LOCK:
         pulses = WIND_PULSE_COUNT
         WIND_PULSE_COUNT = 0
-        return pulses
+    return pulses
 
 # ------------------------
-# Simulated sensor functions (replace with real sensor reads)
+# Simulated sensors
 # ------------------------
 def read_sht_temp_humidity():
-    """
-    SHT temperature + humidity sensor (SIMULATED).
-    Replace with real code, e.g.:
-        temperature = sht.temperature
-        humidity    = sht.relative_humidity
-    """
-    temperature = round(25 + random.uniform(-3, 3), 2)  # °C
-    humidity = round(60 + random.uniform(-15, 15), 2)   # %
+    temperature = round(25 + random.uniform(-3, 3), 2)
+    humidity = round(60 + random.uniform(-15, 15), 2)
     return temperature, humidity
 
 def read_bme280_pressure():
-    """
-    BME280 pressure sensor (SIMULATED).
-    Replace with real code, e.g.:
-        pressure = bme280.pressure
-    """
-    pressure = round(1010 + random.uniform(-10, 10), 3)  # hPa
-    return pressure
+    return round(1010 + random.uniform(-10, 10), 3)
 
-def read_anemometer(interval_s: int, simulate: bool = False):
-    """
-    Classic 3-cup anemometer.
-    If simulate=True -> random wind gust.
-    If simulate=False -> uses pulses counted over interval_s.
-    """
+def read_anemometer(interval_s: int, simulate=False):
     if simulate:
-        return round(random.uniform(0, 30), 3)  # km/h
-
+        return round(random.uniform(0, 30), 3)
     pulses = get_and_reset_wind_pulses()
-    pulses_per_sec = pulses / float(interval_s) if interval_s > 0 else 0.0
-    wind_speed = pulses_per_sec * ANEMO_PULSES_TO_KMPH
-    return round(wind_speed, 3)
+    pulses_per_sec = pulses / float(interval_s) if interval_s > 0 else 0
+    return round(pulses_per_sec * ANEMO_PULSES_TO_KMPH, 3)
 
 # ------------------------
-# Range checks
+# Sanitizers
 # ------------------------
 def sanitize_temperature(t):
-    if t is None:
-        return None
-    if -40.0 <= t <= 85.0:
-        return t
-    logging.warning("Discarding temperature out of range: %s", t)
-    return None
+    return t if -40 <= t <= 85 else None
 
 def sanitize_humidity(h):
-    if h is None:
-        return None
-    if 0.0 <= h <= 100.0:
-        return h
-    logging.warning("Discarding humidity out of range: %s", h)
-    return None
+    return h if 0 <= h <= 100 else None
 
 def sanitize_pressure(p):
-    if p is None:
-        return None
-    if 800.0 <= p <= 1100.0:
-        return p
-    logging.warning("Discarding pressure out of range: %s", p)
-    return None
+    return p if 800 <= p <= 1100 else None
 
 # ------------------------
-# Historical feature helpers (using DB)
+# Historical placeholder (CSV-only → no DB history)
 # ------------------------
-def get_rain_total_since(minutes: int, now_dt: datetime) -> float:
-    """Total rainfall_mm in the last `minutes` minutes (excluding current interval)."""
-    cutoff_iso = (now_dt - timedelta(minutes=minutes)).isoformat()
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            "SELECT SUM(rainfall_mm) FROM weather_log WHERE timestamp_utc >= ?",
-            (cutoff_iso,),
-        )
-        row = c.fetchone()
-        return float(row[0]) if row and row[0] is not None else 0.0
-
-def get_first_pressure_humidity_since_15min(now_dt: datetime):
-    """Pressure & humidity from the earliest row in last 15 min, if any."""
-    cutoff_iso = (now_dt - timedelta(minutes=15)).isoformat()
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            SELECT pressure, humidity
-            FROM weather_log
-            WHERE timestamp_utc >= ?
-            ORDER BY timestamp_utc ASC
-            LIMIT 1
-            """,
-            (cutoff_iso,),
-        )
-        row = c.fetchone()
-        if row:
-            p, h = row
-            return (float(p) if p is not None else None,
-                    float(h) if h is not None else None)
-    return None, None
+def get_rain_total_since(minutes: int):
+    """No database → no history → return 0."""
+    return 0.0
 
 # ------------------------
-# Business logic
+# Build feature row
 # ------------------------
-def get_rainfall_mm():
-    """Convert tipping-bucket tips to mm, then reset counter."""
-    tips = get_and_reset_persistent_counter()
-    mm_per_tip = float(read_meta("rain_mm_per_tip", RAIN_GAUGE_MM_PER_TIP))
-    mm = tips * mm_per_tip
-    return round(mm, 3), tips
-
-def build_realtime_features(interval_s: int, simulate: bool = False) -> dict:
-    """
-    Collect sensors, compute historical features, and build one ML-ready row.
-    """
-    now_dt_utc = now_utc()
-    ts_utc_iso = now_dt_utc.isoformat()
+def build_realtime_features(interval_s: int, simulate=False):
     ts_csv = now_local_for_csv()
 
-    # --- raw sensors ---
     temperature, humidity = read_sht_temp_humidity()
     pressure = read_bme280_pressure()
-    rainfall_mm, tips = get_rainfall_mm()
-    wind_gust = read_anemometer(interval_s=interval_s, simulate=simulate)
+    rainfall_mm = get_and_reset_rain_tips() * RAIN_GAUGE_MM_PER_TIP
+    wind_gust = read_anemometer(interval_s, simulate)
 
-    # sanity
-    temperature = sanitize_temperature(temperature)
-    humidity = sanitize_humidity(humidity)
-    pressure = sanitize_pressure(pressure)
+    temperature = sanitize_temperature(temperature) or 0
+    humidity = sanitize_humidity(humidity) or 0
+    pressure = sanitize_pressure(pressure) or 0
 
-    # --- historical features (using DB history BEFORE inserting current row) ---
-    rain_last_5 = get_rain_total_since(5, now_dt_utc) + (rainfall_mm or 0.0)
-    rain_last_15 = get_rain_total_since(15, now_dt_utc) + (rainfall_mm or 0.0)
+    rain_last_5 = get_rain_total_since(5) + rainfall_mm
+    rain_last_15 = get_rain_total_since(15) + rainfall_mm
 
-    first_p_15, first_h_15 = get_first_pressure_humidity_since_15min(now_dt_utc)
-
-    if first_p_15 is not None and pressure is not None:
-        pressure_drop_15 = round(first_p_15 - pressure, 3)
-    else:
-        pressure_drop_15 = 0.0
-
-    if first_h_15 is not None and humidity is not None:
-        humidity_change = round(humidity - first_h_15, 3)
-    else:
-        humidity_change = 0.0
-
-    # placeholders for external / ML fields
-    satellite_precip = 0.0
-    radar_dbz = 0.0
-    cloudburst = 0  # no label in realtime
-    forecast_30min = 0.0  # later: ML forecast
+    pressure_drop_15min = 0.0
+    humidity_change = 0.0
 
     row = {
-        "timestamp_utc": ts_utc_iso,
         "timestamp": ts_csv,
         "location_id": LOCATION_ID,
-        "rainfall_mm": float(rainfall_mm or 0.0),
-        "humidity": float(humidity or 0.0),
-        "pressure": float(pressure or 0.0),
-        "temperature": float(temperature or 0.0),
-        "wind_gust": float(wind_gust or 0.0),
-        "satellite_precip": float(satellite_precip),
-        "radar_dbz": float(radar_dbz),
-        "cloudburst": int(cloudburst),
-        "rain_last_5min": float(rain_last_5),
-        "rain_last_15min": float(rain_last_15),
-        "pressure_drop_15min": float(pressure_drop_15),
-        "humidity_change": float(humidity_change),
-        "forecast_30min": float(forecast_30min),
+        "rainfall_mm": rainfall_mm,
+        "humidity": humidity,
+        "pressure": pressure,
+        "temperature": temperature,
+        "wind_gust": wind_gust,
+        "satellite_precip": 0.0,
+        "radar_dbz": 0.0,
+        "cloudburst": 0,
+        "rain_last_5min": rain_last_5,
+        "rain_last_15min": rain_last_15,
+        "pressure_drop_15min": pressure_drop_15min,
+        "humidity_change": humidity_change,
+        "forecast_30min": 0.0,
     }
     return row
 
-def log_to_database(row: dict):
-    with get_conn() as conn:
-        c = conn.cursor()
-        c.execute(
-            """
-            INSERT INTO weather_log (
-                timestamp_utc, timestamp, location_id,
-                rainfall_mm, humidity, pressure, temperature,
-                wind_gust, satellite_precip, radar_dbz, cloudburst,
-                rain_last_5min, rain_last_15min,
-                pressure_drop_15min, humidity_change,
-                forecast_30min
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                row["timestamp_utc"],
-                row["timestamp"],
-                row["location_id"],
-                row["rainfall_mm"],
-                row["humidity"],
-                row["pressure"],
-                row["temperature"],
-                row["wind_gust"],
-                row["satellite_precip"],
-                row["radar_dbz"],
-                row["cloudburst"],
-                row["rain_last_5min"],
-                row["rain_last_15min"],
-                row["pressure_drop_15min"],
-                row["humidity_change"],
-                row["forecast_30min"],
-            ),
-        )
-        conn.commit()
-
-def append_to_realtime_csv(row: dict):
-    """Append a row in the EXACT column order your ML needs."""
-    import csv
+# ------------------------
+# CSV logging
+# ------------------------
+def append_to_realtime_csv(row):
     file_exists = os.path.exists(REALTIME_CSV_PATH)
     with open(REALTIME_CSV_PATH, "a", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=FINAL_CSV_COLUMNS)
         if not file_exists:
             writer.writeheader()
-        writer.writerow({
-            "timestamp": row["timestamp"],
-            "location_id": row["location_id"],
-            "rainfall_mm": row["rainfall_mm"],
-            "humidity": row["humidity"],
-            "pressure": row["pressure"],
-            "temperature": row["temperature"],
-            "wind_gust": row["wind_gust"],
-            "satellite_precip": row["satellite_precip"],
-            "radar_dbz": row["radar_dbz"],
-            "cloudburst": row["cloudburst"],
-            "rain_last_5min": row["rain_last_5min"],
-            "rain_last_15min": row["rain_last_15min"],
-            "pressure_drop_15min": row["pressure_drop_15min"],
-            "humidity_change": row["humidity_change"],
-            "forecast_30min": row["forecast_30min"],
-        })
-    logging.info("Realtime CSV row written: %s", row)
+        writer.writerow(row)
+    logging.info("CSV row written: %s", row)
 
 # ------------------------
-# CLI / Main
+# Main loop
 # ------------------------
-def main_loop(simulate: bool = False, interval: int = 60):
-    init_database()
-    logging.info("Starting main loop (simulate=%s, interval=%s)", simulate, interval)
-
+def main_loop(simulate=False, interval=60):
     try:
         while True:
-            # Simulate some tips in this interval when in simulate mode
             if simulate:
                 for _ in range(random.randint(0, 3)):
                     if random.random() < 0.4:
                         rain_gauge_callback()
 
-            row = build_realtime_features(interval_s=interval, simulate=simulate)
-            log_to_database(row)
+            row = build_realtime_features(interval, simulate)
             append_to_realtime_csv(row)
             logging.info("Saved row: %s", json.dumps(row))
 
             time.sleep(1 if simulate else interval)
     except KeyboardInterrupt:
-        logging.info("Shutting down loop (KeyboardInterrupt)")
+        logging.info("Stopping loop…")
 
-def run_once(simulate: bool = False, interval: int = 60):
-    init_database()
+# ------------------------
+# Run-once mode
+# ------------------------
+def run_once(simulate=False, interval=60):
     if simulate:
         for _ in range(6):
             if random.random() < 0.4:
                 rain_gauge_callback()
             time.sleep(0.05)
-    row = build_realtime_features(interval_s=interval, simulate=simulate)
-    log_to_database(row)
+
+    row = build_realtime_features(interval, simulate)
     append_to_realtime_csv(row)
     print(json.dumps(row, indent=2))
 
+# ------------------------
+# CLI
+# ------------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--simulate", action="store_true",
-        help="Run simulated mode (fake sensors, faster loop)"
-    )
-    parser.add_argument(
-        "--interval", type=int, default=60,
-        help="Logging interval in seconds for real mode"
-    )
-    parser.add_argument(
-        "--once", action="store_true",
-        help="Run one cycle and exit"
-    )
+    parser.add_argument("--simulate", action="store_true")
+    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
 
     if args.once:
