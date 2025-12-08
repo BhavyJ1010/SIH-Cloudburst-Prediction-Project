@@ -1,0 +1,13 @@
+location_id_enc
+rainfall_mm
+humidity
+pressure
+temperature
+wind_gust
+satellite_precip
+radar_dbz
+rain_last_5min
+rain_last_15min
+pressure_drop_15min
+humidity_change
+forecast_30min
