@@ -5,7 +5,7 @@ Weather station logger (v3) matching ML schema (CSV-only version)
 Fields:
 timestamp, location_id, rainfall_mm, humidity, pressure, temperature,
 wind_gust, satellite_precip, radar_dbz, cloudburst,
-rain_last_5min, rain_last_15min, pressure_drop_15min,
+rain_last_5min, rain_last_15min, pressure_drop_5min, pressure_drop_15min,
 humidity_change, forecast_30min
 
 Hardware design target:
@@ -83,6 +83,7 @@ FINAL_CSV_COLUMNS = [
     "cloudburst",
     "rain_last_5min",
     "rain_last_15min",
+    "pressure_drop_5min",
     "pressure_drop_15min",
     "humidity_change",
     "forecast_30min",
@@ -235,6 +236,7 @@ def compute_rolling_features(now_dt_utc, current_rain, current_pressure, current
     Using in-memory HISTORY, compute:
     - rain_last_5min
     - rain_last_15min
+    - pressure_drop_5min
     - pressure_drop_15min
     - humidity_change
     """
@@ -248,6 +250,7 @@ def compute_rolling_features(now_dt_utc, current_rain, current_pressure, current
 
     first_p_15 = None
     first_h_15 = None
+    first_p_5 = None
 
     for entry in HISTORY:
         ts = entry["timestamp_utc"]
@@ -261,6 +264,14 @@ def compute_rolling_features(now_dt_utc, current_rain, current_pressure, current
 
         if ts >= cutoff_5:
             rain_last_5 += r
+            if first_p_5 is None:
+                first_p_5 = entry["pressure"]
+
+    # pressure drops: earlier - current (positive = drop)
+    if first_p_5 is not None and current_pressure is not None:
+        pressure_drop_5 = round(first_p_5 - current_pressure, 3)
+    else:
+        pressure_drop_5 = 0.0
 
     if first_p_15 is not None and current_pressure is not None:
         pressure_drop_15 = round(first_p_15 - current_pressure, 3)
@@ -272,7 +283,7 @@ def compute_rolling_features(now_dt_utc, current_rain, current_pressure, current
     else:
         humidity_change = 0.0
 
-    return rain_last_5, rain_last_15, pressure_drop_15, humidity_change
+    return rain_last_5, rain_last_15, pressure_drop_5, pressure_drop_15, humidity_change
 
 def build_realtime_features(interval_s: int, simulate: bool = False) -> dict:
     """
@@ -299,7 +310,7 @@ def build_realtime_features(interval_s: int, simulate: bool = False) -> dict:
     pressure = float(pressure or 0.0)
 
     # --- rolling features using in-memory history BEFORE adding current row ---
-    rain_last_5, rain_last_15, pressure_drop_15, humidity_change = compute_rolling_features(
+    rain_last_5, rain_last_15, pressure_drop_5, pressure_drop_15, humidity_change = compute_rolling_features(
         now_dt_utc, rainfall_mm, pressure, humidity
     )
 
@@ -325,6 +336,7 @@ def build_realtime_features(interval_s: int, simulate: bool = False) -> dict:
         "cloudburst": int(cloudburst),
         "rain_last_5min": float(rain_last_5),
         "rain_last_15min": float(rain_last_15),
+        "pressure_drop_5min": float(pressure_drop_5),
         "pressure_drop_15min": float(pressure_drop_15),
         "humidity_change": float(humidity_change),
         "forecast_30min": float(forecast_30min),
