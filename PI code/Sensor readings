@@ -13,11 +13,7 @@ Hardware design target:
 - Tipping bucket rain gauge           (reed switch, GPIO)
 - Classic 3-cup anemometer            (reed switch, GPIO)
 
-Current code uses SIMULATED readings. Replace the bodies of:
-  - read_sht_temp_humidity()
-  - read_bme280_pressure()
-  - read_anemometer()
-with real hardware calls when your sensors are wired.
+
 """
 
 import time
