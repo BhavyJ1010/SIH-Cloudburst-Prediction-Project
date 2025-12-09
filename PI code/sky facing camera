@@ -1,0 +1,258 @@
+#!/usr/bin/env python3
+"""
+Optimized sky camera processing for Raspberry Pi.
+
+Features:
+- Cloud motion (Farnebäck optical flow)
+- Cloud optical properties (brightness, contrast, dark index, cloud fraction, texture)
+- Vertical growth metrics (darkening rate, cloud area growth, texture growth)
+- Simple vertical growth / storm potential flag
+"""
+
+import cv2
+import numpy as np
+import time
+import math
+
+# =============== CONFIG ====================
+STREAM_URL = "http://192.168.1.20:8080/video"
+SAMPLE_INTERVAL_SEC = 10
+
+TARGET_WIDTH = 640
+TARGET_HEIGHT = 360
+
+MIN_FLOW_MAG = 0.3
+MAX_FLOW_MAG = 20.0
+
+HFOV_DEG = 90.0
+CLOUD_HEIGHT_M = 2000
+
+# Use only top part of frame for sky
+ROI_TOP_FRACTION = 0.7
+
+
+# =============== UTILS =====================
+
+def compute_meters_per_pixel(width_px, hfov_deg, cloud_height_m):
+    hfov_rad = math.radians(hfov_deg)
+    scene_width_m = 2 * cloud_height_m * math.tan(hfov_rad / 2.0)
+    return scene_width_m / float(width_px)
+
+
+def angle_to_direction(angle_deg):
+    angle = (angle_deg + 360) % 360
+    dirs = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]
+    idx = int(((angle + 22.5) % 360) / 45)
+    return dirs[idx]
+
+
+def compute_cloud_optical_features(gray_roi):
+    g = gray_roi.astype(np.float32)
+
+    brightness = float(g.mean())
+    contrast = float(g.std())
+
+    DARK_THRESHOLD = 90
+    dark_fraction = float((g < DARK_THRESHOLD).mean())
+
+    CLOUD_THRESHOLD = 200
+    cloud_fraction = float((g < CLOUD_THRESHOLD).mean())
+
+    lap = cv2.Laplacian(gray_roi, cv2.CV_32F)
+    texture_index = float(np.mean(np.abs(lap)))
+
+    brightness_norm = brightness / 255.0
+
+    if brightness_norm > 0.7 and dark_fraction < 0.15:
+        thickness = "THIN"
+    elif 0.4 < brightness_norm <= 0.7 and dark_fraction < 0.40:
+        thickness = "MEDIUM"
+    else:
+        thickness = "THICK_CONVECTIVE"
+
+    return {
+        "brightness": brightness,
+        "contrast": contrast,
+        "dark_fraction": dark_fraction,
+        "cloud_fraction": cloud_fraction,
+        "texture_index": texture_index,
+        "thickness_class": thickness,
+    }
+
+
+def compute_vertical_growth(prev_optical, optical, dt_min):
+    if dt_min <= 0:
+        dt_min = 1e-3
+
+    darkening_rate = (prev_optical["brightness"] - optical["brightness"]) / dt_min
+    cloud_area_growth_rate = (
+        optical["cloud_fraction"] - prev_optical["cloud_fraction"]
+    ) / dt_min
+    texture_growth_rate = (
+        optical["texture_index"] - prev_optical["texture_index"]
+    ) / dt_min
+
+    # Tuned thresholds (you can adjust)
+    rapid_darkening = darkening_rate > 8.0 and optical["brightness"] < 170
+    fast_cloud_growth = cloud_area_growth_rate > 0.08 and optical["cloud_fraction"] > 0.6
+    texture_increase = texture_growth_rate > 1.5 and optical["texture_index"] > 6.0
+
+    vertical_growth_flag = (
+        rapid_darkening
+        and fast_cloud_growth
+        and texture_increase
+        and optical["thickness_class"] == "THICK_CONVECTIVE"
+    )
+
+    return darkening_rate, cloud_area_growth_rate, texture_growth_rate, vertical_growth_flag
+
+
+def compute_flow(prev_gray_roi, gray_roi, dt_sec, m_per_px):
+    if dt_sec <= 0:
+        dt_sec = 1e-3
+
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray_roi, gray_roi,
+        None,
+        pyr_scale=0.5,
+        levels=2,
+        winsize=11,
+        iterations=2,
+        poly_n=5,
+        poly_sigma=1.1,
+        flags=0
+    )
+
+    vx = flow[..., 0]
+    vy = flow[..., 1]
+    mag = np.sqrt(vx**2 + vy**2)
+    mask = (mag > MIN_FLOW_MAG) & (mag < MAX_FLOW_MAG)
+
+    if not np.any(mask):
+        return None, None, None, None, None
+
+    vx_valid = vx[mask]
+    vy_valid = vy[mask]
+    mag_valid = mag[mask]
+
+    mean_vx = float(np.median(vx_valid))
+    mean_vy = float(np.median(vy_valid))
+    mean_mag = float(np.median(mag_valid))
+
+    vx_frame = mean_vx
+    vy_frame = -mean_vy  # invert y for "up is North"
+
+    angle_rad = math.atan2(vy_frame, vx_frame)
+    angle_deg = math.degrees(angle_rad)
+    direction = angle_to_direction(angle_deg)
+
+    px_per_sec = mean_mag / dt_sec
+    m_per_sec = px_per_sec * m_per_px
+    km_per_h = m_per_sec * 3.6
+
+    return mean_vx, mean_vy, direction, km_per_h, px_per_sec
+
+
+# =============== MAIN LOOP ==================
+
+def main():
+    cap = cv2.VideoCapture(STREAM_URL)
+    if not cap.isOpened():
+        print("❌ Could not open video stream.")
+        return
+
+    print("✅ Connected to phone sky camera.")
+
+    prev_gray_roi = None
+    prev_time = None
+    prev_optical = None
+    m_per_px = None
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("⚠️ Failed to grab frame. Retrying...")
+            time.sleep(1)
+            continue
+
+        frame = cv2.resize(frame, (TARGET_WIDTH, TARGET_HEIGHT))
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        h, w = gray.shape
+        roi = gray[0:int(h * ROI_TOP_FRACTION), :]
+
+        if m_per_px is None:
+            m_per_px = compute_meters_per_pixel(w, HFOV_DEG, CLOUD_HEIGHT_M)
+
+        optical = compute_cloud_optical_features(roi)
+
+        now = time.time()
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+
+        features = {
+            "timestamp": timestamp,
+            "brightness": optical["brightness"],
+            "contrast": optical["contrast"],
+            "dark_fraction": optical["dark_fraction"],
+            "cloud_fraction": optical["cloud_fraction"],
+            "texture_index": optical["texture_index"],
+            "thickness_class": optical["thickness_class"],
+            "darkening_rate": None,
+            "cloud_area_growth_rate": None,
+            "texture_growth_rate": None,
+            "vertical_growth_flag": 0,
+            "cloud_vx": None,
+            "cloud_vy": None,
+            "cloud_speed_kmh": None,
+            "cloud_direction": None,
+        }
+
+        if prev_optical is not None and prev_time is not None:
+            dt_sec = now - prev_time
+            dt_min = dt_sec / 60.0
+
+            dr, ca_gr, tx_gr, vflag = compute_vertical_growth(prev_optical, optical, dt_min)
+            features["darkening_rate"] = dr
+            features["cloud_area_growth_rate"] = ca_gr
+            features["texture_growth_rate"] = tx_gr
+            features["vertical_growth_flag"] = int(vflag)
+
+        if prev_gray_roi is not None and prev_time is not None:
+            dt_sec = now - prev_time
+            mean_vx, mean_vy, direction, km_per_h, px_per_sec = compute_flow(
+                prev_gray_roi, roi, dt_sec, m_per_px
+            )
+            if direction is not None:
+                features["cloud_vx"] = mean_vx
+                features["cloud_vy"] = mean_vy
+                features["cloud_speed_kmh"] = km_per_h
+                features["cloud_direction"] = direction
+
+        # ---- Print short summary ----
+        print("──────────────")
+        print("🕒", timestamp)
+        print(
+            f"Thick={features['thickness_class']}, "
+            f"Brightness={features['brightness']:.1f}, "
+            f"CloudFrac={features['cloud_fraction']:.2f}"
+        )
+        if features["vertical_growth_flag"]:
+            print("⚡ Vertical growth: STRONG (possible convective build-up)")
+        if features["cloud_direction"] is not None:
+            print(
+                f"Motion: {features['cloud_direction']}, "
+                f"{features['cloud_speed_kmh']:.1f} km/h"
+            )
+        print("──────────────\n")
+
+        # TODO: here you can send `features` to API or save to CSV
+
+        prev_gray_roi = roi
+        prev_optical = optical
+        prev_time = now
+
+        time.sleep(SAMPLE_INTERVAL_SEC)
+
+
+if __name__ == "__main__":
+    main()
