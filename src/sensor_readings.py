@@ -69,4 +69,5 @@ while True:
         print("No new data found.")
 
     print("Waiting for next update...\n")
-    time.sleep(60)
+    time.sleep(30)
+
