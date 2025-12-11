@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-"""
-cloudburst_pipeline_v2_pi_ready.py
-
-Enhanced version of the user's pipeline. Preserves all original functions and behaviour
-but adds robustness, Raspberry Pi friendly options, flexible CSV handling, resampling,
-lighter-mode for Pi, CLI flags to control heavy operations, and more logging.
-
-How this script is organized:
- - Original functions (kalman_1d, filters, clean_and_smooth, add_features, train_model)
-   kept and used.
- - New helpers: flexible timestamp detection, safe numeric coercion, resampling to uniform
-   interval, optional Pi-compatible downcasting, output directory handling, and CLI flags.
-
-Note: This file intentionally keeps original function names so your existing code that
-imports or references them continues to work.
-"""
-
 import argparse
 import os
 import sys
